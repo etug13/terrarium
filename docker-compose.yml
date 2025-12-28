@@ -1,7 +1,14 @@
-version: '3.8'
-
 services:
-  # Baza danych dla pomiarów (TimeSeries)
+  api:
+    image: ghcr.io/etug13/repozytorium/terrarium-api:latest
+    ports:
+      - "8000:8000"
+    restart: always
+
+  bridge:
+    image: ghcr.io/etug13/repozytorium/terrarium-bridge:latest
+    restart: always
+
   influxdb:
     image: influxdb:2.7
     container_name: terrarium_influx
@@ -21,7 +28,6 @@ services:
     volumes:
       - grafana_data:/var/lib/grafana
 
-  # Baza dla szybkich nastawów i parametrów regulatora
   redis:
     image: redis:alpine
     container_name: terrarium_settings
