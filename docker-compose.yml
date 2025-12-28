@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  # Baza danych dla pomiarów (TimeSeries)
+  influxdb:
+    image: influxdb:2.7
+    container_name: terrarium_influx
+    ports:
+      - "8086:8086"
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+
+  # Panel sterowania i wykresy
+  grafana:
+    image: grafana/grafana:latest
+    container_name: terrarium_grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - influxdb
+    volumes:
+      - grafana_data:/var/lib/grafana
+
+  # Baza dla szybkich nastawów i parametrów regulatora
+  redis:
+    image: redis:alpine
+    container_name: terrarium_settings
+    ports:
+      - "6379:6379"
+
+volumes:
+  influxdb_data:
+  grafana_data:
