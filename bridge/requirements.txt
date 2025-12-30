@@ -1,3 +1,6 @@
 influxdb_client
 redis
 uvicorn
+dotenv
+fastapi
+pydantic
