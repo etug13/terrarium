@@ -4,6 +4,8 @@ from influxdb_client import InfluxDBClient
 import os
 
 INFLUX_DB_TOKEN = os.getenv("INFLUX_DB_TOKEN")
+ORG = os.getenv("INFLUX_DB_ORG", "Terrarium")
+BUCKET = os.getenv("INFLUX_DB_BUCKET", "terrarium_logs")
 
 app = FastAPI()
 
@@ -12,7 +14,7 @@ r = redis.Redis(host='terrarium_settings', port=6379, db=0)
 client = InfluxDBClient(
     url="http://terrarium_influx:8086", 
     token=INFLUX_DB_TOKEN, 
-    org="PRUT")
+    org=ORG)
 
 @app.get("/status")
 def get_status():
