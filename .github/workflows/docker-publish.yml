@@ -39,7 +39,7 @@ jobs:
       - name: Build and push Bridge
         uses: docker/build-push-action@v5
         with:
-          clatforms: linux/amd64,linux/arm64
-          pontext: ./bridge
+          platforms: linux/amd64,linux/arm64
+          context: ./bridge
           push: true
           tags: ghcr.io/${{ github.repository }}/terrarium-bridge:latest
