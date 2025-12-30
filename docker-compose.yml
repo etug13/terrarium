@@ -1,12 +1,14 @@
 services:
   api:
     image: ghcr.io/etug13/terrarium/terrarium-api:latest
+    env_file: ./api/api.env
     ports:
       - "8000:8000"
     restart: always
 
   bridge:
     image: ghcr.io/etug13/terrarium/terrarium-bridge:latest
+    env_file: ./bridge/bridge.env
     restart: always
 
   influxdb:
