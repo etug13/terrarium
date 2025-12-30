@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 token = os.getenv("INFLUX_DB_TOKEN")
 org = "PRUT"
-url = "http://localhost:8086"
+url = "http://influxdb:8086"
 bucket = "terrarium_logs"
 
 client = influxdb_client.InfluxDBClient(url=url, token=token, org=org)
