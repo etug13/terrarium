@@ -4,3 +4,4 @@ uvicorn
 dotenv
 fastapi
 pydantic
+pyserial
