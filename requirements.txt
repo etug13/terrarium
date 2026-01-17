@@ -1,4 +1,4 @@
 pydantic
 pyserial
-influxdb_client
 dotenv
+supabase

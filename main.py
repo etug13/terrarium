@@ -3,37 +3,36 @@ import json
 import time
 from pydantic import BaseModel
 import os
-import influxdb_client
 import logging
-from influxdb_client.client.write_api import SYNCHRONOUS
+import requests
+import asyncio
+import aiohttp
+from dotenv import load_dotenv
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("terrarium_controller")
 
+load_dotenv()
 
-INFLUX_TOKEN = os.getenv("INFLUX_DB_TOKEN")
-INFLUX_ORG = "Terrarium"
-INFLUX_URL = "http://terrarium_influx:8086"
-INFLUX_BUCKET = "terrarium_logs"
-SEND_INTERVAL = 2.0  # Wyślij komendę do Arduino nie częściej niż co 2 sekundy
+TS_LOGS_CHANNEL_ID = os.getenv("TS_LOGS_CHANNEL_ID")
+TS_LOGS_WRITE_KEY = os.getenv("TS_LOGS_WRITE_API_KEY")
+TS_LOGS_READ_KEY = os.getenv("TS_LOGS_READ_API_KEY")
+
+TS_SETTINGS_CHANNEL_ID = os.getenv("TS_SETTINGS_CHANNEL_ID")
+TS_SETTINGS_WRITE_KEY = os.getenv("TS_SETTINGS_WRITE_API_KEY")
+TS_SETTINGS_READ_KEY = os.getenv("TS_SETTINGS_READ_API_KEY")
+
+SEND_INTERVAL = 1.0  # Wyślij komendę do Arduino nie częściej niż co 2 sekundy
 
 class Settings(BaseModel):
     temp_setting: float = 25.0
     hum_setting: float = 30.0
-    pm_setting: float = 250
-    fan_delta: float = 5.0
-    heat_hysteresis: float = 0.5
+    aq_thresh_setting: float = 250
+    # fan_delta: float = 5.0
+    # heat_hysteresis: float = 0.5
 
-    def load_settings(file_path='settings.json'):
-        try:
-            with open(file_path, 'r') as f:
-                data = json.load(f)
-                settings = Settings(**data)
-                return settings
-        except Exception as e:
-            print(f"Błąd wczytywania ustawień: {e}")
-            return Settings()  # Domyślne ustawienia
-
+class LogParams(BaseModel):
+    pass
 
 # --- KLASA PID DLA WENTYLATORA ---
 class CoolingPID:
@@ -105,64 +104,105 @@ class CoolingPID:
         self.Ki = ki
         self.Kd = kd
 
-    # NOWA METODA: Zmiana celu temperatury
     def set_target(self, new_target):
         self.target = new_target
 
 class HeatingController:
-    def __init__(self, heat_hysteresis=0.5, setpoint=25.0):
+    def __init__(self, heat_hysteresis=0.5, heat_setting=25.0):
         self.heating_hysteresis = heat_hysteresis
-        self.setpoint = setpoint
+        self.setpoint = heat_setting
         self.is_heating = False
 
-    def update(self, current_temp):
+    def calculate_heating(self, current_temp):
         if not self.is_heating and current_temp < (self.setpoint - self.heating_hysteresis):
             self.is_heating = True
         elif self.is_heating and current_temp > (self.setpoint + self.heating_hysteresis):
             self.is_heating = False
         return self.is_heating
 
+    def set_setpoint(self, new_temp: int):
+        self.setpoint = new_temp
+
+class HumidifierController:
+    def __init__(self, hum_setting=60.0):
+        self.hum_setting = hum_setting
+        self.is_humidifier_on = False
+    
+    def calculate_humidifier(self, current_hum):
+        if float(current_hum) < self.hum_setting and not self.is_humidifier_on:
+            self.is_humidifier_on = True
+        if float(current_hum) > self.hum_setting and self.is_humidifier_on:
+            self.is_humidifier_on = False
+        return self.is_humidifier_on
 
 class Controller:
-
-    def __init__(self, settings):
-        self.settings: Settings = settings
+    def __init__(self, settings: Settings):
+        self.temp_setting: float = settings.temp_setting
+        self.hum_setting: float = settings.hum_setting
+        self.aq_thresh_setting: float = settings.aq_thresh_setting
+        # self.fan_delta: float = settings.fan_delta
+        # self.heat_hysteresis: float = settings.heat_hysteresis
         self.cooling_pid = CoolingPID(settings.temp_setting + (settings.temp_setting * 0.05), delta_range=5.0)
-        self.heating_controller = HeatingController(heat_hysteresis=0.5, setpoint=settings.temp_setting)
+        self.heating_controller = HeatingController(heat_hysteresis=0.5, heat_setting=settings.temp_setting)
+        self.humidifier_controller = HumidifierController(hum_setting=60.0)
         self.full_speed = False
 
     def process_sensor_data(self, temp, hum, quality):
         
-        if int(quality) > self.settings.pm_setting and not self.full_speed:
+        # wywietrzenie w przypadku slabego powietrza
+        if float(quality) > self.aq_thresh_setting and not self.full_speed:
             self.full_speed = True
             print("Zanieczyszczenie powietrza powyżej progu! Wentylator na pełnej mocy.")
-        elif int(quality) <= self.settings.pm_setting - 50 and self.full_speed:
+        elif float(quality) <= self.aq_thresh_setting - 50 and self.full_speed:
             self.full_speed = False
             print("Jakość powietrza poprawiła się. Wentylator wraca do normalnej pracy.")
         
-
         if self.full_speed:
             fan_speed = 255
         else:
             fan_speed = self.cooling_pid.compute(float(temp))
         
-        heating_on = self.heating_controller.update(float(temp))
+        humidifier_on = self.humidifier_controller.calculate_humidifier(float(hum))
+        heating_on = self.heating_controller.calculate_heating(float(temp))
         
-        return fan_speed, heating_on
+        return fan_speed, heating_on, humidifier_on
+
+    def update_settings(self, new_settings: Settings):
+
+        if self.temp_setting != new_settings.temp_setting:
+            self.heating_controller.set_setpoint(new_settings.temp_setting)
+            self.cooling_pid.set_target(new_settings.temp_setting)
+
+        if self.hum_setting != new_settings.hum_setting:
+            self.hum_setting = new_settings.hum_setting
+        
+        if self.aq_thresh_setting != new_settings.aq_thresh_setting:
+            self.aq_thresh_setting = new_settings.aq_thresh_setting
+
+class ThingspeakClient:
+    def __init__(self):
+        self.ts_logs_channel_id = TS_LOGS_CHANNEL_ID
+        self.ts_setings_channel_id = TS_SETTINGS_CHANNEL_ID
+        self.ts_settings_read_key = TS_SETTINGS_READ_KEY
+        self.ts_logs_write_key = TS_LOGS_WRITE_KEY
+
+    # field1 - temperatur
+    # field2 - humidity
+    # field3 - air_quality
+    # field4 - set_temp
+    # field5 - set_hum
+
+    def write_logs(self, params):
+        pass
+
+    def fetch_and_update_settings(self, update_settings: callable):
+        pass
+
+    
 
 
     
 def main():
-
-    if INFLUX_TOKEN:
-        try:
-            client = influxdb_client.InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
-            write_api = client.write_api(write_options=SYNCHRONOUS)
-            logger.info("Connected to InfluxDB")
-        except Exception as e:
-            logger.error(f"Failed to connect to InfluxDB: {e}")
-    else:
-        logger.warning("INFLUX_DB_TOKEN not set. Logging disabled.")
 
     for i in range(4):
         try:
@@ -176,10 +216,15 @@ def main():
         print("Nie znaleziono dostępnego portu szeregowego. Upewnij się, że urządzenie jest podłączone.")
         return
     
-    settings = Settings.load_settings()
+    settings = Settings(
+        temp_setting = 25.0,
+        hum_setting = 60.0,
+        aq_thresh_setting = 200
+    )
+
     controller = Controller(settings)
     
-    last_send_time = 0  # <--- MUSI BYĆ TUTAJ, przed while
+    last_send_time = 0
 
     while True:
         if ser.in_waiting > 0:
@@ -194,31 +239,27 @@ def main():
 
             logger.info(f"RX: {line}")
             
-            try:
-                parts = line.split(";")
+            parts = line.split(";")
+            
+            # Walidacja: Obsłuż zarówno 3 parametry (dane) jak i 9 (dane + echo)
+            if len(parts) >= 3:
+                temp = float(parts[0])
+                hum = float(parts[1])
+                quality = float(parts[2])
                 
-                # Walidacja: Obsłuż zarówno 3 parametry (dane) jak i 9 (dane + echo)
-                if len(parts) >= 3:
-                    temp = float(parts[0])
-                    hum = float(parts[1])
-                    quality = float(parts[2])
-                    
-                    fan_speed, heating_on = controller.process_sensor_data(temp, hum, quality)
+                fan_speed, heating_on, humidifier_on = controller.process_sensor_data(temp, hum, quality)
 
-                    # WYSYŁKA TYLKO CO 2 SEKUNDY
-                    current_time = time.time()
-                    if current_time - last_send_time > SEND_INTERVAL:
-                        heat_pwm = 255 if heating_on else 0
-                        mist_pwm = 0 
-                        
-                        # Zmieniam 255 na obliczone fan_speed!
-                        command = f"{fan_speed};{heat_pwm};{mist_pwm};{settings.temp_setting};{settings.hum_setting}\n"
-                        ser.write(command.encode('utf-8'))
-                        logger.info(f"TX: {command.strip()}")
-                        last_send_time = current_time  # <--- Aktualizacja czasu
+                # WYSYŁKA TYLKO CO 2 SEKUNDY
+                current_time = time.time()
+                if current_time - last_send_time > SEND_INTERVAL:
+                    heat_pwm = 255 if heating_on else 0
+                    mist = 1 if humidifier_on else 0
                     
-            except Exception as e:
-                logger.error(f"Błąd: {e}")
+                    command = f"{fan_speed};{heat_pwm};{mist};{controller.temp_setting};{controller.hum_setting}\n"
+                    ser.write(command.encode('utf-8'))
+                    logger.info(f"TX: {command.strip()}")
+                    last_send_time = current_time
+
 
 
 if __name__ == "__main__":

@@ -1,43 +1,47 @@
+version: '3.3'
+
 services:
   api:
     image: ghcr.io/etug13/terrarium/terrarium-api:latest
+    container_name: terrarium_api
     environment:
       - INFLUX_DB_TOKEN=${INFLUX_DB_TOKEN}
+      - INFLUX_DB_URL=http://influxdb:8086
+      - INFLUX_DB_ORG=terrarium
+      - INFLUX_DB_BUCKET=data
     ports:
       - "8000:8000"
     restart: always
+    depends_on:
+      - influxdb
 
   bridge:
     image: ghcr.io/etug13/terrarium/terrarium-bridge:latest
+    container_name: terrarium_bridge
     environment:
       - INFLUX_DB_TOKEN=${INFLUX_DB_TOKEN}
+      - INFLUX_DB_URL=http://influxdb:8086
+      - INFLUX_DB_ORG=terrarium
+      - INFLUX_DB_BUCKET=data
     restart: always
+    depends_on:
+      - influxdb
 
   influxdb:
-    image: influxdb:2.7
+    image: influxdb:2.0
     container_name: terrarium_influx
     ports:
       - "8086:8086"
     volumes:
       - influxdb_data:/var/lib/influxdb2
-
-  # Panel sterowania i wykresy
-  grafana:
-    image: grafana/grafana:latest
-    container_name: terrarium_grafana
-    ports:
-      - "3000:3000"
-    depends_on:
-      - influxdb
-    volumes:
-      - grafana_data:/var/lib/grafana
-
-  redis:
-    image: redis:alpine
-    container_name: terrarium_settings
-    ports:
-      - "6379:6379"
+    environment:
+      # Te zmienne pozwalają na automatyczną inicjalizację bazy przy pierwszym uruchomieniu
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=adminpassword123
+      - DOCKER_INFLUXDB_INIT_ORG=terrarium
+      - DOCKER_INFLUXDB_INIT_BUCKET=data
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=${INFLUX_DB_TOKEN}
 
 volumes:
   influxdb_data:
-  grafana_data:
