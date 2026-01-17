@@ -1,6 +1,7 @@
 import serial
 import json
 import time
+import glob
 from pydantic import BaseModel
 import os
 import logging
@@ -22,7 +23,7 @@ TS_SETTINGS_CHANNEL_ID = os.getenv("TS_SETTINGS_CHANNEL_ID")
 TS_SETTINGS_WRITE_KEY = os.getenv("TS_SETTINGS_WRITE_API_KEY")
 TS_SETTINGS_READ_KEY = os.getenv("TS_SETTINGS_READ_API_KEY")
 
-SEND_INTERVAL = 1.0  # Wyślij komendę do Arduino nie częściej niż co 2 sekundy
+SEND_INTERVAL = 1.0
 
 class Settings(BaseModel):
     temp_setting: float = 25.0
@@ -34,7 +35,7 @@ class Settings(BaseModel):
 class LogParams(BaseModel):
     pass
 
-# --- KLASA PID DLA WENTYLATORA ---
+
 class CoolingPID:
     def __init__(self, target, delta_range):
         self.target = target
@@ -140,29 +141,39 @@ class Controller:
         self.temp_setting: float = settings.temp_setting
         self.hum_setting: float = settings.hum_setting
         self.aq_thresh_setting: float = settings.aq_thresh_setting
+        self.aq_trigger_delay = 0
         # self.fan_delta: float = settings.fan_delta
         # self.heat_hysteresis: float = settings.heat_hysteresis
         self.cooling_pid = CoolingPID(settings.temp_setting + (settings.temp_setting * 0.05), delta_range=5.0)
         self.heating_controller = HeatingController(heat_hysteresis=0.5, heat_setting=settings.temp_setting)
-        self.humidifier_controller = HumidifierController(hum_setting=60.0)
+        self.humidifier_controller = HumidifierController(self.humidifier_controller)
         self.full_speed = False
 
     def process_sensor_data(self, temp, hum, quality):
         
+        self.aq_trigger_delay -= 1
         # wywietrzenie w przypadku slabego powietrza
-        if float(quality) > self.aq_thresh_setting and not self.full_speed:
-            self.full_speed = True
-            print("Zanieczyszczenie powietrza powyżej progu! Wentylator na pełnej mocy.")
-        elif float(quality) <= self.aq_thresh_setting - 50 and self.full_speed:
-            self.full_speed = False
-            print("Jakość powietrza poprawiła się. Wentylator wraca do normalnej pracy.")
-        
+        if self.aq_trigger_delay > 0:   
+            if float(quality) > self.aq_thresh_setting and not self.full_speed:
+                self.full_speed = True
+                print("Zanieczyszczenie powietrza powyżej progu! Wentylator na pełnej mocy.")
+            elif float(quality) <= self.aq_thresh_setting - 50 and self.full_speed:
+                self.full_speed = False
+                print("Jakość powietrza poprawiła się. Wentylator wraca do normalnej pracy.")
+        else:
+            print("Ignoruje zanieczyszczenie powietrza, wynik zaburzony przez generator")
+
+
         if self.full_speed:
             fan_speed = 255
         else:
             fan_speed = self.cooling_pid.compute(float(temp))
         
         humidifier_on = self.humidifier_controller.calculate_humidifier(float(hum))
+
+        if humidifier_on:
+            self.aq_trigger_delay = 10
+
         heating_on = self.heating_controller.calculate_heating(float(temp))
         
         return fan_speed, heating_on, humidifier_on
@@ -199,26 +210,40 @@ class ThingspeakClient:
         pass
 
     
+def find_and_connect_serial():
+        """Szuka dostępnych portów ttyUSB/ttyACM i próbuje się połączyć"""
+        # Wzorce nazw portów na Linux/Raspberry Pi
+        patterns = ['/dev/ttyUSB*', '/dev/ttyACM*']
+        candidates = []
+        for p in patterns:
+            candidates.extend(glob.glob(p))
+            
+        if not candidates:
+            print("[INIT] ❌ BŁĄD: Nie znaleziono żadnych urządzeń Arduino!")
+            print("       Sprawdź kabel USB (czy nie jest 'tylko do ładowania').")
+            print("       Wpisz w terminalu: ls /dev/tty* aby zobaczyć dostępne urządzenia.")
+            return None
 
+        for port in candidates:
+            try:
+                print(f"[INIT] Próba połączenia z {port}...")
+                ser = serial.Serial(port, 9600, timeout=0.1)
+                print(f"[INIT] ✅ Sukces! Połączono z {port}")
+                return ser
+            except Exception as e:
+                print(f"[INIT] Nie udało się otworzyć {port}: {e}")
+        
+        print("[INIT] Znaleziono porty, ale żadnego nie udało się otworzyć.")
+        return None
 
     
 def main():
 
-    for i in range(4):
-        try:
-            ser = serial.Serial(f'/dev/ttyUSB{i}', 9600, timeout=1)
-            print(f"Znaleziono port szeregowy /dev/ttyUSB{i}")
-            ser.flush()
-            break
-        except serial.serialutil.SerialException as e:
-            print(f"Błąd otwarcia portu szeregowego {i}: {e}")
-    else:
-        print("Nie znaleziono dostępnego portu szeregowego. Upewnij się, że urządzenie jest podłączone.")
-        return
+    ser = find_and_connect_serial()
     
     settings = Settings(
         temp_setting = 25.0,
-        hum_setting = 60.0,
+        hum_setting = 40.0,
         aq_thresh_setting = 200
     )
 
@@ -235,7 +260,7 @@ def main():
                 logger.warning("Błąd dekodowania linii (śmieci na UART)")
                 continue
             
-            if not line: continue
+            if not line: continue 
 
             logger.info(f"RX: {line}")
             
@@ -249,7 +274,6 @@ def main():
                 
                 fan_speed, heating_on, humidifier_on = controller.process_sensor_data(temp, hum, quality)
 
-                # WYSYŁKA TYLKO CO 2 SEKUNDY
                 current_time = time.time()
                 if current_time - last_send_time > SEND_INTERVAL:
                     heat_pwm = 255 if heating_on else 0
