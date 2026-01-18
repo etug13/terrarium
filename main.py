@@ -48,8 +48,8 @@ class CoolingPID:
         
         # Ki i Kd dobieramy eksperymentalnie, ale przy wentylatorach
         # zazwyczaj wystarczy samo P lub PI.
-        self.Ki = 2.0  
-        self.Kd = 0.5  
+        self.Ki = 0 
+        self.Kd = 1.0
 
         self.prev_error = 0
         self.integral = 0
@@ -163,7 +163,7 @@ class Controller:
         if float(quality) > self.aq_thresh_setting:
             if self.aq_trigger_delay == 0:
                 self.clear_smog = True
-            print("Zanieczyszczenie powietrza powyżej progu! Wentylator na pełnej mocy.")
+                # print("Zanieczyszczenie powietrza powyżej progu! Wentylator na pełnej mocy.")
         elif float(quality) <= self.aq_thresh_setting * 0.9:
             self.clear_smog = False
             print("Jakość powietrza poprawiła się. Wentylator wraca do normalnej pracy.")
@@ -189,7 +189,7 @@ class Controller:
             humidifier_on = self.humidifier_controller.calculate_humidifier(float(hum))
 
         if humidifier_on:
-            self.aq_trigger_delay = 60
+            self.aq_trigger_delay = 90
 
         heating_on = self.heating_controller.calculate_heating(float(temp))
         
