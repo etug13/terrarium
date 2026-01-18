@@ -72,10 +72,9 @@ def update_settings(
 # 3. Funkcja pobierająca ustawienia (READ LAST)
 def get_settings():
     # Pobieramy ostatni wpis z kanału, żeby sprawdzić pola ustawień (Field 3, 4, 5)
-    url = f"https://api.thingspeak.com/channels/{TS_LOGS_CHANNEL_ID}/feeds"
+    url = f"https://api.thingspeak.com/channels/{TS_SETTINGS_CHANNEL_ID}/feeds/last.json"
     params = {
-        "api_key": TS_LOGS_READ_KEY,
-        "results": 10,
+        "api_key": TS_SETTINGS_READ_KEY,
         }
     
     try:
@@ -104,4 +103,5 @@ if __name__ == "__main__":
     # for feed in response_dict["feeds"]:
     #     print(feed["created_at"] + " " + feed["field4"])
 
-    update_settings(25, 30, 200)
+    print(get_settings())
+    update_settings(30.0, 70.0, 2000)

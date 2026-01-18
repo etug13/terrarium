@@ -8,6 +8,7 @@ import logging
 import requests
 import asyncio
 import aiohttp
+import threading
 from dotenv import load_dotenv
 
 logging.basicConfig(level=logging.INFO)
@@ -125,16 +126,19 @@ class HeatingController:
         self.setpoint = new_temp
 
 class HumidifierController:
-    def __init__(self, hum_setting=60.0):
+    def __init__(self, hum_setting):
         self.hum_setting = hum_setting
         self.is_humidifier_on = False
     
     def calculate_humidifier(self, current_hum):
-        if float(current_hum) < self.hum_setting and not self.is_humidifier_on:
+        if float(current_hum) < self.hum_setting:
             self.is_humidifier_on = True
-        if float(current_hum) > self.hum_setting and self.is_humidifier_on:
+        if float(current_hum) > self.hum_setting:
             self.is_humidifier_on = False
         return self.is_humidifier_on
+
+    def set_hum(self, new_hum):
+        self.hum_setting = new_hum
 
 class Controller:
     def __init__(self, settings: Settings):
@@ -146,33 +150,46 @@ class Controller:
         # self.heat_hysteresis: float = settings.heat_hysteresis
         self.cooling_pid = CoolingPID(settings.temp_setting + (settings.temp_setting * 0.05), delta_range=5.0)
         self.heating_controller = HeatingController(heat_hysteresis=0.5, heat_setting=settings.temp_setting)
-        self.humidifier_controller = HumidifierController(self.humidifier_controller)
-        self.full_speed = False
+        self.humidifier_controller = HumidifierController(hum_setting=self.hum_setting)
+        self.clear_smog = False
+        self.clear_humidity = False
 
     def process_sensor_data(self, temp, hum, quality):
         
-        self.aq_trigger_delay -= 1
+        if self.aq_trigger_delay > 0:
+            self.aq_trigger_delay -= 1
         # wywietrzenie w przypadku slabego powietrza
-        if self.aq_trigger_delay > 0:   
-            if float(quality) > self.aq_thresh_setting and not self.full_speed:
-                self.full_speed = True
-                print("Zanieczyszczenie powietrza powyżej progu! Wentylator na pełnej mocy.")
-            elif float(quality) <= self.aq_thresh_setting - 50 and self.full_speed:
-                self.full_speed = False
-                print("Jakość powietrza poprawiła się. Wentylator wraca do normalnej pracy.")
-        else:
-            print("Ignoruje zanieczyszczenie powietrza, wynik zaburzony przez generator")
+
+        if float(quality) > self.aq_thresh_setting:
+            if self.aq_trigger_delay == 0:
+                self.clear_smog = True
+            print("Zanieczyszczenie powietrza powyżej progu! Wentylator na pełnej mocy.")
+        elif float(quality) <= self.aq_thresh_setting * 0.9:
+            self.clear_smog = False
+            print("Jakość powietrza poprawiła się. Wentylator wraca do normalnej pracy.")
 
 
-        if self.full_speed:
-            fan_speed = 255
+        if float(hum) > self.hum_setting + 10:
+                self.clear_humidity = True
+                print("wilgotnosc powietrza powyżej progu! Wentylator na pełnej mocy.")
+        elif float(hum) <= self.hum_setting:
+            self.clear_humidity = False
+            print("wilgotnosc powietrza poprawiła się. Wentylator wraca do normalnej pracy.")
+        
+        if self.clear_smog:
+                fan_speed=255
+        elif self.clear_humidity:
+            fan_speed = 170
         else:
             fan_speed = self.cooling_pid.compute(float(temp))
         
-        humidifier_on = self.humidifier_controller.calculate_humidifier(float(hum))
+        if self.clear_smog:
+            humidifier_on = False
+        else:
+            humidifier_on = self.humidifier_controller.calculate_humidifier(float(hum))
 
         if humidifier_on:
-            self.aq_trigger_delay = 10
+            self.aq_trigger_delay = 60
 
         heating_on = self.heating_controller.calculate_heating(float(temp))
         
@@ -183,32 +200,116 @@ class Controller:
         if self.temp_setting != new_settings.temp_setting:
             self.heating_controller.set_setpoint(new_settings.temp_setting)
             self.cooling_pid.set_target(new_settings.temp_setting)
+            self.temp_setting = new_settings.temp_setting
 
         if self.hum_setting != new_settings.hum_setting:
+            self.humidifier_controller.set_hum(new_settings.hum_setting)
             self.hum_setting = new_settings.hum_setting
         
         if self.aq_thresh_setting != new_settings.aq_thresh_setting:
             self.aq_thresh_setting = new_settings.aq_thresh_setting
 
 class ThingspeakClient:
-    def __init__(self):
+    def __init__(self, update_settings_callback):
         self.ts_logs_channel_id = TS_LOGS_CHANNEL_ID
-        self.ts_setings_channel_id = TS_SETTINGS_CHANNEL_ID
+        self.ts_settings_channel_id = TS_SETTINGS_CHANNEL_ID
         self.ts_settings_read_key = TS_SETTINGS_READ_KEY
         self.ts_logs_write_key = TS_LOGS_WRITE_KEY
+        self.update_settings_callback = update_settings_callback
+        
+        self.latest_data = {}
+        # Flagi do akumulacji stanu (jeśli choć raz włączono w cyklu)
+        self.fan_triggered = False
+        self.mist_triggered = False
+        self.heat_triggered = False
+        
+        self.lock = threading.Lock()
+        self.running = True
 
-    # field1 - temperatur
-    # field2 - humidity
-    # field3 - air_quality
-    # field4 - set_temp
-    # field5 - set_hum
+    def start(self):
+        """Uruchamia wątki w tle"""
+        t_logs = threading.Thread(target=self._logs_loop, daemon=True)
+        t_settings = threading.Thread(target=self._settings_loop, daemon=True)
+        t_logs.start()
+        t_settings.start()
 
-    def write_logs(self, params):
-        pass
+    def update_current_state(self, temp, hum, set_temp, set_hum, aq, fan, mist, heat, aq_thresh):
+        """Aktualizuje dane, które zostaną wysłane w najbliższym cyklu"""
+        with self.lock:
+            # Akumulacja stanów (sticky bits)
+            if fan > 0:
+                self.fan_triggered = True
+            if mist > 0:
+                self.mist_triggered = True
+            if heat > 0:
+                self.heat_triggered = True
 
-    def fetch_and_update_settings(self, update_settings: callable):
-        pass
+            self.latest_data = {
+                "field1": temp,
+                "field2": hum,
+                "field3": aq,
+                "field4": set_temp,
+                "field5": set_hum,
+                # field6 jest obliczany w pętli wysyłania (fan + mist)
+                "field7": heat,
+                "field8": aq_thresh,
+            }
 
+    def _logs_loop(self):
+        """Wysyłanie logów co 15 sekund"""
+        while self.running:
+            time.sleep(15)
+            data_to_send = None
+            with self.lock:
+                if self.latest_data:
+                    data_to_send = self.latest_data.copy()
+                    
+                    # Obliczanie statusu binarnego dla field6
+                    # 1 = Fan ON, 2 = Mist ON, 3 = Both ON
+                    status = 0
+                    if self.fan_triggered:
+                        status += 1
+                    elif self.mist_triggered:
+                        status += 2
+                    
+                    data_to_send["field6"] = status
+                    
+                    # Reset akumulatorów po przygotowaniu danych do wysyłki
+                    self.fan_triggered = False
+                    self.mist_triggered = False
+                    self.heat_triggered = False
+            
+            if data_to_send:
+                try:
+                    url = "https://api.thingspeak.com/update"
+                    data_to_send["api_key"] = self.ts_logs_write_key
+                    requests.post(url, data=data_to_send, timeout=5)
+                    logger.info(f"[TS] Wysłano logi do chmury (Status={data_to_send.get('field6')}).")
+                except Exception as e:
+                    logger.error(f"[TS] Błąd wysyłania logów: {e}")
+
+    def _settings_loop(self):
+        """Pobieranie ustawień co 15 sekund"""
+        while self.running:
+            try:
+                url = f"https://api.thingspeak.com/channels/{self.ts_settings_channel_id}/feeds/last.json"
+                params = {"api_key": self.ts_settings_read_key}
+                response = requests.get(url, params=params, timeout=5)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    # Parsowanie pól (zakładamy: f1=Temp, f2=Hum, f3=AQ)
+                    new_settings = Settings(
+                        temp_setting=float(data.get("field1")),
+                        hum_setting=float(data.get("field2")),
+                        aq_thresh_setting=float(data.get("field3"))
+                    )
+                    self.update_settings_callback(new_settings)
+                    # logger.info("[TS] Zaktualizowano ustawienia z chmury.")
+            except Exception as e:
+                logger.error(f"[TS] Błąd pobierania ustawień: {e}")
+            
+            time.sleep(15)
     
 def find_and_connect_serial():
         """Szuka dostępnych portów ttyUSB/ttyACM i próbuje się połączyć"""
@@ -249,10 +350,15 @@ def main():
 
     controller = Controller(settings)
     
+    # INICJALIZACJA THINGSPEAK
+    # Przekazujemy metodę controller.update_settings jako callback
+    ts_client = ThingspeakClient(controller.update_settings)
+    ts_client.start()
+    
     last_send_time = 0
 
     while True:
-        if ser.in_waiting > 0:
+        if ser and ser.in_waiting > 0:
             raw_line = ser.readline()
             try:
                 line = raw_line.decode('utf-8').rstrip()
@@ -268,21 +374,40 @@ def main():
             
             # Walidacja: Obsłuż zarówno 3 parametry (dane) jak i 9 (dane + echo)
             if len(parts) >= 3:
-                temp = float(parts[0])
-                hum = float(parts[1])
-                quality = float(parts[2])
-                
-                fan_speed, heating_on, humidifier_on = controller.process_sensor_data(temp, hum, quality)
+                try:
+                    temp = float(parts[0])
+                    hum = float(parts[1])
+                    quality = float(parts[2])
+                    
+                    fan_speed, heating_on, humidifier_on = controller.process_sensor_data(temp, hum, quality)
 
-                current_time = time.time()
-                if current_time - last_send_time > SEND_INTERVAL:
+                    # AKTUALIZACJA DANYCH DLA WĄTKU TŁA
                     heat_pwm = 255 if heating_on else 0
                     mist = 1 if humidifier_on else 0
                     
-                    command = f"{fan_speed};{heat_pwm};{mist};{controller.temp_setting};{controller.hum_setting}\n"
-                    ser.write(command.encode('utf-8'))
-                    logger.info(f"TX: {command.strip()}")
-                    last_send_time = current_time
+                    # POPRAWKA: Przekazujemy argumenty zgodnie z nową logiką
+                    # Kolejność w update_current_state: temp, hum, set_temp, set_hum, aq, fan, mist, heat, aq_thresh
+                    ts_client.update_current_state(
+                        temp, 
+                        hum, 
+                        controller.temp_setting, 
+                        controller.hum_setting, 
+                        quality, 
+                        fan_speed, 
+                        mist,
+                        heat_pwm,
+                        controller.aq_thresh_setting # Dodano próg AQ
+                    )
+
+                    current_time = time.time()
+                    if current_time - last_send_time > SEND_INTERVAL:
+                        
+                        command = f"{fan_speed};{heat_pwm};{mist};{controller.temp_setting};{controller.hum_setting}\n"
+                        ser.write(command.encode('utf-8'))
+                        logger.info(f"TX: {command.strip()}")
+                        last_send_time = current_time
+                except ValueError:
+                    logger.error("Błąd parsowania danych")
 
 
 
